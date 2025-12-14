@@ -5,7 +5,6 @@ import dev.lvstrng.argon.event.events.TickListener;
 import dev.lvstrng.argon.module.Category;
 import dev.lvstrng.argon.module.Module;
 import dev.lvstrng.argon.module.setting.BooleanSetting;
-import dev.lvstrng.argon.module.setting.KeybindSetting;
 import dev.lvstrng.argon.module.setting.NumberSetting;
 import dev.lvstrng.argon.utils.EncryptedString;
 import dev.lvstrng.argon.utils.InventoryUtils;
@@ -19,23 +18,62 @@ import net.minecraft.util.hit.EntityHitResult;
 import org.lwjgl.glfw.GLFW;
 
 public final class ShieldDisabler extends Module implements TickListener, AttackListener {
-	private final NumberSetting hitDelay = new NumberSetting(EncryptedString.of("Hit Delay"), 0, 20, 0, 1);
-	private final NumberSetting switchDelay = new NumberSetting(EncryptedString.of("Switch Delay"), 0, 20, 0, 1);
-	private final BooleanSetting switchBack = new BooleanSetting(EncryptedString.of("Switch Back"), true);
-	private final BooleanSetting stun = new BooleanSetting(EncryptedString.of("Stun"), false);
-	private final BooleanSetting clickSimulate = new BooleanSetting(EncryptedString.of("Click Simulation"), false);
-	private final BooleanSetting requireHoldAxe = new BooleanSetting(EncryptedString.of("Hold Axe"), false);
 
-	int previousSlot, hitClock, switchClock;
+	/* ================= SETTINGS ================= */
+
+	private final NumberSetting hitDelay =
+			new NumberSetting(EncryptedString.of("Hit Delay"), 0, 20, 0, 1);
+
+	private final NumberSetting switchDelay =
+			new NumberSetting(EncryptedString.of("Switch Delay"), 0, 20, 0, 1);
+
+	private final NumberSetting cps =
+			new NumberSetting(EncryptedString.of("CPS"), 6, 20, 12, 1);
+
+	private final BooleanSetting switchBack =
+			new BooleanSetting(EncryptedString.of("Switch Back"), true);
+
+	private final BooleanSetting stun =
+			new BooleanSetting(EncryptedString.of("Stun"), false);
+
+	private final BooleanSetting clickSimulate =
+			new BooleanSetting(EncryptedString.of("Click Simulation"), false);
+
+	private final BooleanSetting requireHoldAxe =
+			new BooleanSetting(EncryptedString.of("Hold Axe"), false);
+
+	/* ================= STATE ================= */
+
+	private int previousSlot = -1;
+	private int hitClock;
+	private int switchClock;
+
+	private long lastClickTime = 0;
+	private int clickStage = 0; // 0 = first click, 1 = second click
+	private boolean didDoubleClick = false;
+
+	/* ================= CONSTRUCTOR ================= */
 
 	public ShieldDisabler() {
-		super(EncryptedString.of("Shield Disabler"),
+		super(
+				EncryptedString.of("Shield Disabler"),
 				EncryptedString.of("Automatically disables your opponents shield"),
 				-1,
-				Category.COMBAT);
+				Category.COMBAT
+		);
 
-		addSettings(switchDelay, hitDelay, switchBack, stun, clickSimulate, requireHoldAxe);
+		addSettings(
+				switchDelay,
+				hitDelay,
+				cps,
+				switchBack,
+				stun,
+				clickSimulate,
+				requireHoldAxe
+		);
 	}
+
+	/* ================= ENABLE / DISABLE ================= */
 
 	@Override
 	public void onEnable() {
@@ -45,6 +83,10 @@ public final class ShieldDisabler extends Module implements TickListener, Attack
 		hitClock = hitDelay.getValueInt();
 		switchClock = switchDelay.getValueInt();
 		previousSlot = -1;
+
+		clickStage = 0;
+		didDoubleClick = false;
+
 		super.onEnable();
 	}
 
@@ -55,66 +97,111 @@ public final class ShieldDisabler extends Module implements TickListener, Attack
 		super.onDisable();
 	}
 
+	/* ================= MAIN LOGIC ================= */
+
 	@Override
 	public void onTick() {
 		if (mc.currentScreen != null)
 			return;
 
-		if(requireHoldAxe.getValue() && !(mc.player.getMainHandStack().getItem() instanceof AxeItem))
+		if (requireHoldAxe.getValue()
+				&& !(mc.player.getMainHandStack().getItem() instanceof AxeItem))
 			return;
 
-		if (mc.crosshairTarget instanceof EntityHitResult entityHit) {
-			Entity entity = entityHit.getEntity();
+		if (!(mc.crosshairTarget instanceof EntityHitResult entityHit))
+			return;
 
-			if (mc.player.isUsingItem())
+		Entity entity = entityHit.getEntity();
+
+		if (!(entity instanceof PlayerEntity player))
+			return;
+
+		if (mc.player.isUsingItem())
+			return;
+
+		if (WorldUtils.isShieldFacingAway(player))
+			return;
+
+		/* ================= SHIELD BLOCKING ================= */
+
+		if (player.isHolding(Items.SHIELD) && player.isBlocking()) {
+
+			// Switch delay
+			if (switchClock > 0) {
+				if (previousSlot == -1)
+					previousSlot = mc.player.getInventory().selectedSlot;
+
+				switchClock--;
 				return;
+			}
 
-			if (entity instanceof PlayerEntity player) {
-				if (WorldUtils.isShieldFacingAway(player))
+			// CPS-perfect double click
+			if (InventoryUtils.selectAxe() && !didDoubleClick) {
+
+				long now = System.currentTimeMillis();
+				long delay = 1000L / cps.getValueInt();
+
+				if (now - lastClickTime < delay)
 					return;
 
-				if (player.isHolding(Items.SHIELD) && player.isBlocking()) {
-					if (switchClock > 0) {
-						if (previousSlot == -1)
-							previousSlot = mc.player.getInventory().selectedSlot;
+				lastClickTime = now;
 
-						switchClock--;
-						return;
+				// First click
+				if (clickStage == 0) {
+					if (clickSimulate.getValue())
+						MouseSimulation.mouseClick(GLFW.GLFW_MOUSE_BUTTON_LEFT);
+
+					WorldUtils.hitEntity(player, true);
+					clickStage = 1;
+					return;
+				}
+
+				// Second click
+				if (clickStage == 1) {
+					if (clickSimulate.getValue())
+						MouseSimulation.mouseClick(GLFW.GLFW_MOUSE_BUTTON_LEFT);
+
+					WorldUtils.hitEntity(player, true);
+
+					if (stun.getValue()) {
+						if (clickSimulate.getValue())
+							MouseSimulation.mouseClick(GLFW.GLFW_MOUSE_BUTTON_LEFT);
+
+						WorldUtils.hitEntity(player, true);
 					}
 
-					if (InventoryUtils.selectAxe()) {
-						if (hitClock > 0) {
-							hitClock--;
-						} else {
-							if (clickSimulate.getValue())
-								MouseSimulation.mouseClick(GLFW.GLFW_MOUSE_BUTTON_LEFT);
+					clickStage = 0;
+					didDoubleClick = true;
 
-							WorldUtils.hitEntity(player, true);
-
-							if (stun.getValue()) {
-								if (clickSimulate.getValue())
-									MouseSimulation.mouseClick(GLFW.GLFW_MOUSE_BUTTON_LEFT);
-
-								WorldUtils.hitEntity(player, true);
-							}
-
-							hitClock = hitDelay.getValueInt();
-							switchClock = switchDelay.getValueInt();
-						}
-					}
-				} else if (previousSlot != -1) {
-					if (switchBack.getValue())
-						InventoryUtils.setInvSlot(previousSlot);
-
-					previousSlot = -1;
+					hitClock = hitDelay.getValueInt();
+					switchClock = switchDelay.getValueInt();
 				}
 			}
+
+		} else {
+			/* ================= RESET ================= */
+
+			if (previousSlot != -1) {
+				if (switchBack.getValue())
+					InventoryUtils.setInvSlot(previousSlot);
+
+				previousSlot = -1;
+			}
+
+			clickStage = 0;
+			didDoubleClick = false;
 		}
 	}
 
+	/* ================= ATTACK CANCEL ================= */
+
 	@Override
 	public void onAttack(AttackListener.AttackEvent event) {
-		if (GLFW.glfwGetMouseButton(mc.getWindow().getHandle(), GLFW.GLFW_MOUSE_BUTTON_LEFT) != GLFW.GLFW_PRESS)
+		if (GLFW.glfwGetMouseButton(
+				mc.getWindow().getHandle(),
+				GLFW.GLFW_MOUSE_BUTTON_LEFT
+		) != GLFW.GLFW_PRESS) {
 			event.cancel();
+		}
 	}
 }
